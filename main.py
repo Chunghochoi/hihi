@@ -21,9 +21,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import re
 import socket
+import string
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 
@@ -44,15 +47,20 @@ from telegram.constants import ParseMode
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 
-# TikTok API endpoint gửi view
-TIKTOK_VIEW_API = (
-    "https://api16-normal-c-useast1a.tiktokv.com/aweme/v1/playtime/"
-)
+# TikTok API servers (xoay vòng để tránh rate-limit)
+TIKTOK_API_SERVERS = [
+    "https://api16-normal-c-useast1a.tiktokv.com",
+    "https://api19-core-c-useast1a.tiktokv.com",
+    "https://api16-normal-useast5.tiktokv.com",
+    "https://api21-normal-c-useast1a.tiktokv.com",
+    "https://api22-normal-c-useast1a.tiktokv.com",
+]
+TIKTOK_PLAY_PATH   = "/aweme/v1/playtime/"
 
-REPORT_INTERVAL    = 30   # giây giữa 2 lần báo cáo
-PROXY_CHECK_TIMEOUT = 8   # giây timeout khi test proxy
-PROXY_TEST_URL     = "https://www.tiktok.com/"
-DEFAULT_WORKERS    = 300
+REPORT_INTERVAL     = 30   # giây giữa 2 lần báo cáo
+PROXY_CHECK_TIMEOUT = 8    # giây timeout khi test proxy
+PROXY_TEST_URL      = "https://www.tiktok.com/"
+DEFAULT_WORKERS     = 300
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
@@ -212,75 +220,194 @@ def detect_scheme_from_filename(filename: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def resolve_short_url(url: str) -> str:
-    if "vt.tiktok.com" in url or "vm.tiktok.com" in url:
-        try:
-            sess = cfreqs.AsyncSession(impersonate="chrome110")
-            resp = await sess.head(url, allow_redirects=True, timeout=10)
-            return str(resp.url)
-        except Exception:
-            pass
-    return url
-
-
-async def fetch_video_info(url: str) -> Optional[Dict]:
     """
-    Scrape HTML trang video TikTok để lấy:
-      video_id, title, views, likes, saves, shares
+    Resolve vt.tiktok.com / vm.tiktok.com sang URL đầy đủ có /video/ID.
+    Dùng GET (không phải HEAD) vì TikTok không trả Location cho HEAD.
     """
-    url = await resolve_short_url(url)
-    video_id = extract_video_id(url)
-
+    if not ("vt.tiktok.com" in url or "vm.tiktok.com" in url):
+        return url
     try:
         sess = cfreqs.AsyncSession(impersonate="chrome110")
         headers = {
-            "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                               "AppleWebKit/537.36 (KHTML, like Gecko) "
-                               "Chrome/110.0.0.0 Safari/537.36",
-            "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.8",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         }
-        resp = await sess.get(url, headers=headers, timeout=15)
-        html = resp.text
+        resp = await sess.get(url, headers=headers, allow_redirects=True, timeout=15)
+        final_url = str(resp.url)
+        log.info(f"[Resolve] {url} → {final_url}")
+        return final_url
+    except Exception as exc:
+        log.warning(f"[Resolve] Lỗi resolve short URL: {exc}")
+        return url
 
-        def _extract(pattern: str, default: int = 0) -> int:
-            m = re.search(pattern, html, re.IGNORECASE)
-            if not m:
-                return default
-            raw = m.group(1).replace(",", "").strip().upper()
-            for suffix, mult in {"K": 1_000, "M": 1_000_000, "B": 1_000_000_000}.items():
-                if raw.endswith(suffix):
-                    try:
-                        return int(float(raw[:-1]) * mult)
-                    except ValueError:
-                        return default
+
+def _parse_count(raw) -> int:
+    """Chuyển đổi số dạng 1.2M / 3.5K / 1234567 → int."""
+    if raw is None:
+        return 0
+    if isinstance(raw, (int, float)):
+        return int(raw)
+    s = str(raw).replace(",", "").strip().upper()
+    for suf, mult in [("B", 1_000_000_000), ("M", 1_000_000), ("K", 1_000)]:
+        if s.endswith(suf):
             try:
-                return int(raw)
+                return int(float(s[:-1]) * mult)
             except ValueError:
-                return default
+                return 0
+    try:
+        return int(float(s))
+    except ValueError:
+        return 0
 
-        views  = _extract(r'"playCount"\s*:\s*"?(\d[\d.,KMBkmb]*)"?')
-        likes  = _extract(r'"diggCount"\s*:\s*"?(\d[\d.,KMBkmb]*)"?')
-        saves  = _extract(r'"collectCount"\s*:\s*"?(\d[\d.,KMBkmb]*)"?')
-        shares = _extract(r'"shareCount"\s*:\s*"?(\d[\d.,KMBkmb]*)"?')
 
-        title_m = re.search(r'<title>([^<]+)</title>', html)
-        title   = title_m.group(1).strip()[:60] if title_m else "N/A"
+async def fetch_video_info(url: str, proxy: Optional[str] = None) -> Optional[Dict]:
+    """
+    Lấy thông tin video TikTok:
+      1. Resolve short URL → URL đầy đủ (lấy video_id)
+      2. Thử oEmbed API (không cần auth, lấy title)
+      3. Scrape HTML → parse JSON __UNIVERSAL_DATA_FOR_REHYDRATION__ / SIGI_STATE
+         để lấy playCount, diggCount, collectCount, shareCount
+    Tham số proxy: nên dùng proxy nếu có để tránh bị Railway IP block.
+    """
+    import json as _json
 
+    # Dùng proxy đầu tiên nếu không truyền vào
+    if proxy is None and STATE.proxies:
+        proxy = STATE.proxies[0]
+
+    url      = await resolve_short_url(url)
+    video_id = extract_video_id(url)
+    log.info(f"[VideoInfo] URL sau resolve: {url} | video_id: {video_id}")
+
+    headers_web = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer":         "https://www.tiktok.com/",
+    }
+
+    title  = "N/A"
+    views  = 0
+    likes  = 0
+    saves  = 0
+    shares = 0
+
+    proxy_cfg = {"http": proxy, "https": proxy} if proxy else {}
+
+    # ── Bước 1: oEmbed (lấy title nhanh) ─────────────────────────────────────
+    try:
+        sess = cfreqs.AsyncSession(impersonate="chrome110")
+        if proxy_cfg:
+            sess.proxies = proxy_cfg
+        oe = await sess.get(
+            f"https://www.tiktok.com/oembed?url={url}",
+            headers=headers_web, timeout=10,
+        )
+        if oe.status_code == 200:
+            oe_data = oe.json()
+            title   = oe_data.get("title", "N/A")[:80]
+            # oEmbed không trả view count nên tiếp tục scrape HTML
+    except Exception as exc:
+        log.warning(f"[oEmbed] {exc}")
+
+    # ── Bước 2: Scrape trang chính lấy số liệu ───────────────────────────────
+    try:
+        sess2 = cfreqs.AsyncSession(impersonate="chrome110")
+        if proxy_cfg:
+            sess2.proxies = proxy_cfg
+        resp  = await sess2.get(url, headers=headers_web, timeout=20)
+        html  = resp.text
+
+        # Cập nhật video_id nếu chưa có (lấy từ URL sau redirect)
         if not video_id:
-            video_id = extract_video_id(str(getattr(resp, "url", url))) or "unknown"
+            video_id = extract_video_id(str(getattr(resp, "url", url)))
 
-        return {
-            "video_id": video_id,
-            "url":      url,
-            "title":    title,
-            "views":    views,
-            "likes":    likes,
-            "saves":    saves,
-            "shares":   shares,
-        }
+        # ── Thử parse __UNIVERSAL_DATA_FOR_REHYDRATION__ ──────────────────
+        m = re.search(
+            r'<script[^>]+id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([^<]+)</script>',
+            html, re.DOTALL,
+        )
+        if m:
+            try:
+                data    = _json.loads(m.group(1))
+                # Đi xuống cây JSON tìm stats
+                def _dig(obj, *keys):
+                    for k in keys:
+                        if isinstance(obj, dict) and k in obj:
+                            obj = obj[k]
+                        else:
+                            return None
+                    return obj
+
+                # Tìm itemInfo > itemStruct > stats
+                item_struct = (
+                    _dig(data, "__DEFAULT_SCOPE__", "webapp.video-detail", "itemInfo", "itemStruct")
+                    or _dig(data, "ItemModule")
+                )
+                if isinstance(item_struct, dict):
+                    # itemStruct trực tiếp
+                    stats = item_struct.get("stats", {})
+                elif isinstance(item_struct, dict):
+                    # ItemModule là {video_id: itemStruct}
+                    first = next(iter(item_struct.values()), {})
+                    stats = first.get("stats", {})
+                else:
+                    stats = {}
+
+                if stats:
+                    views  = _parse_count(stats.get("playCount",   views))
+                    likes  = _parse_count(stats.get("diggCount",   likes))
+                    saves  = _parse_count(stats.get("collectCount", saves))
+                    shares = _parse_count(stats.get("shareCount",  shares))
+                    if not title or title == "N/A":
+                        title = item_struct.get("desc", "N/A")[:80] if isinstance(item_struct, dict) else "N/A"
+                    log.info(f"[VideoInfo] Đọc được từ UNIVERSAL_DATA: views={views}")
+            except Exception as exc:
+                log.warning(f"[VideoInfo] Parse UNIVERSAL_DATA lỗi: {exc}")
+
+        # ── Fallback: regex trực tiếp trong HTML ──────────────────────────
+        if views == 0:
+            def _rex(pattern: str) -> int:
+                fm = re.search(pattern, html, re.IGNORECASE)
+                if not fm:
+                    return 0
+                return _parse_count(fm.group(1))
+
+            views  = views  or _rex(r'"playCount"\s*:\s*"?(\d[\d.,KMBkmb]*)"?')
+            likes  = likes  or _rex(r'"diggCount"\s*:\s*"?(\d[\d.,KMBkmb]*)"?')
+            saves  = saves  or _rex(r'"collectCount"\s*:\s*"?(\d[\d.,KMBkmb]*)"?')
+            shares = shares or _rex(r'"shareCount"\s*:\s*"?(\d[\d.,KMBkmb]*)"?')
+
+            if title == "N/A":
+                tm = re.search(r'<title>([^<]+)</title>', html)
+                if tm:
+                    title = tm.group(1).strip()[:80]
+
+            log.info(f"[VideoInfo] Fallback regex: views={views}")
 
     except Exception as exc:
-        log.error(f"[VideoInfo] fetch lỗi: {exc}")
-        return None
+        log.error(f"[VideoInfo] Scrape lỗi: {exc}")
+
+    if not video_id:
+        video_id = "unknown"
+
+    return {
+        "video_id": video_id,
+        "url":      url,
+        "title":    title,
+        "views":    views,
+        "likes":    likes,
+        "saves":    saves,
+        "shares":   shares,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -316,16 +443,100 @@ async def check_all_proxies(proxies: List[str]) -> Dict[str, bool]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 TLS_PROFILES = [
-    "chrome110", "chrome107", "chrome104",
-    "safari_ios16_0", "safari16_0",
+    "chrome124", "chrome120", "chrome110",
+    "chrome107", "chrome104", "safari17_0",
+    "safari16_0", "safari15_5",
 ]
 
-APP_INFO = {
-    "aid": "1233", "app_name": "musical_ly",
-    "version_code": "300904", "version_name": "30.9.4",
-    "channel": "googleplay", "device_brand": "samsung",
-    "os": "android", "os_version": "13", "os_api": "33",
-}
+DEVICE_BRANDS = ["samsung", "xiaomi", "huawei", "oppo", "vivo", "realme"]
+OS_VERSIONS   = ["12", "13", "14"]
+OS_APIS       = {"12": "32", "13": "33", "14": "34"}
+
+
+def _rand_digits(n: int) -> str:
+    return "".join(random.choices(string.digits, k=n))
+
+
+def _rand_hex(n: int) -> str:
+    return "".join(random.choices("0123456789abcdef", k=n))
+
+
+def make_device() -> dict:
+    """Tạo thông số thiết bị ngẫu nhiên thực tế."""
+    os_ver    = random.choice(OS_VERSIONS)
+    brand     = random.choice(DEVICE_BRANDS)
+    device_id = _rand_digits(19)
+    iid       = _rand_digits(19)   # install_id
+    openudid  = _rand_hex(16)
+    cdid      = str(uuid.uuid4())  # client device id
+    return {
+        "device_id":      device_id,
+        "iid":            iid,
+        "openudid":       openudid,
+        "cdid":           cdid,
+        "device_brand":   brand,
+        "device_type":    f"{brand.upper()}-SM-G991B",
+        "os":             "android",
+        "os_version":     os_ver,
+        "os_api":         OS_APIS[os_ver],
+        "resolution":     random.choice(["1080*2400", "1080*2340", "1440*3200"]),
+        "dpi":            str(random.choice([420, 480, 560])),
+    }
+
+
+def build_view_payload(video_id: str, device: dict, t_start: int, play_delta: int) -> dict:
+    """
+    Xây dựng payload đầy đủ cho TikTok playtime API.
+    Các trường này là bắt buộc để server nhận request.
+    """
+    ver_code = random.choice(["320403", "310303", "300904"])
+    ver_name = {"320403": "32.4.3", "310303": "31.3.3", "300904": "30.9.4"}[ver_code]
+    return {
+        # App info
+        "aid":                "1233",
+        "app_name":           "musical_ly",
+        "app_language":       "en",
+        "version_code":       ver_code,
+        "version_name":       ver_name,
+        "channel":            random.choice(["googleplay", "xiaomi", "huawei_store"]),
+        "ab_version":         ver_name,
+        "ssmix":              "a",
+        "manifest_version_code": ver_code,
+        "update_version_code":   ver_code,
+        # Device
+        "device_id":          device["device_id"],
+        "iid":                device["iid"],
+        "openudid":           device["openudid"],
+        "cdid":               device["cdid"],
+        "device_brand":       device["device_brand"],
+        "device_type":        device["device_type"],
+        "device_platform":    "android",
+        "os":                 "android",
+        "os_version":         device["os_version"],
+        "os_api":             device["os_api"],
+        "resolution":         device["resolution"],
+        "dpi":                device["dpi"],
+        # Network
+        "ac":                 random.choice(["wifi", "4g", "5g"]),
+        "ac2":                "wifi5g",
+        "carrier_region":     random.choice(["US", "GB", "CA", "AU", "SG"]),
+        "sys_region":         "US",
+        "region":             "US",
+        "timezone_name":      "America/New_York",
+        "timezone_offset":    "-14400",
+        "language":           "en",
+        "locale":             "en_US",
+        # Video play info
+        "aweme_id":           video_id,
+        "action_time":        str(t_start),
+        "play_delta":         str(play_delta),
+        "ts":                 str(t_start),
+        "is_play_phone_mode": "0",
+        "play_exit_type":     "3" if play_delta > 0 else "0",
+        # Anti-detection
+        "cronet_version":     "TTNetVersion:6c7669b9 2023-12-18",
+        "build_number":       ver_name,
+    }
 
 
 async def send_single_view(
@@ -334,37 +545,55 @@ async def send_single_view(
     worker_idx: int,
 ) -> bool:
     """
-    Gửi 1 view theo 2 pha:
+    Gửi 1 view theo 2 pha với thiết bị giả lập thực tế:
       Pha 1 — play_delta=0  (bắt đầu xem)
-      Delay — 8–20s         (mô phỏng xem thực)
-      Pha 2 — play_delta=N  (kết thúc xem)
+      Delay — 10–25s        (mô phỏng xem thực)
+      Pha 2 — play_delta=N  (kết thúc xem, N = thời gian đã xem)
+    Xoay vòng giữa nhiều API server.
     """
-    tls  = TLS_PROFILES[worker_idx % len(TLS_PROFILES)]
+    tls    = TLS_PROFILES[worker_idx % len(TLS_PROFILES)]
+    server = TIKTOK_API_SERVERS[worker_idx % len(TIKTOK_API_SERVERS)]
+    api_url = server + TIKTOK_PLAY_PATH
+
     sess = cfreqs.AsyncSession(impersonate=tls)
     if proxy:
         sess.proxies = {"http": proxy, "https": proxy}
 
-    device_id    = str(int(time.time() * 1000) + worker_idx)
-    t_start      = int(time.time())
-    payload_base = {**APP_INFO, "device_id": device_id, "aweme_id": video_id}
+    device  = make_device()
+    t_start = int(time.time())
+
+    # User-Agent khớp với app version
+    ver_name = "30.9.4"
+    ua = (
+        f"com.zhiliaoapp.musically/{device['iid']} "
+        f"(Linux; U; Android {device['os_version']}; en_US; {device['device_type']}; "
+        f"Build/TP1A.220624.014; Cronet/TTNetVersion:6c7669b9 2023-12-18 QuicVersion:0144d358 2023-12-14)"
+    )
+
+    request_headers = {
+        "User-Agent":     ua,
+        "Content-Type":   "application/x-www-form-urlencoded",
+        "X-SS-REQ-TICKET": str(int(time.time() * 1000)),
+        "sdk-version":    "2",
+        "Accept-Encoding": "gzip",
+    }
 
     try:
-        await sess.post(
-            TIKTOK_VIEW_API,
-            data={**payload_base, "action_time": t_start, "play_delta": 0},
-            timeout=10,
-        )
-        # Delay ngẫu nhiên 8–20 giây
-        delay = 8 + abs(hash(device_id)) % 13
-        await asyncio.sleep(delay)
+        # Pha 1: bắt đầu xem
+        payload1 = build_view_payload(video_id, device, t_start, 0)
+        await sess.post(api_url, data=payload1, headers=request_headers, timeout=12)
 
-        t_end = int(time.time())
-        await sess.post(
-            TIKTOK_VIEW_API,
-            data={**payload_base, "action_time": t_end, "play_delta": t_end - t_start},
-            timeout=10,
-        )
-        return True
+        # Mô phỏng thời gian xem: 10–25 giây
+        watch_time = random.randint(10, 25)
+        await asyncio.sleep(watch_time)
+
+        # Pha 2: kết thúc xem
+        t_end   = int(time.time())
+        payload2 = build_view_payload(video_id, device, t_end, t_end - t_start)
+        r2 = await sess.post(api_url, data=payload2, headers=request_headers, timeout=12)
+
+        return r2.status_code < 400
+
     except Exception:
         return False
 
@@ -505,9 +734,16 @@ async def cmd_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
     info = await fetch_video_info(url)
-    if not info or not info.get("video_id"):
-        await msg.edit_text("❌ Không lấy được thông tin video\\. Kiểm tra lại URL\\.",
-                            parse_mode=ParseMode.MARKDOWN_V2)
+    if not info or info.get("video_id") == "unknown":
+        await msg.edit_text(
+            "❌ Không lấy được thông tin video\\.\n\n"
+            "Nguyên nhân có thể:\n"
+            "• TikTok chặn IP server \\(cần proxy\\)\n"
+            "• URL không đúng định dạng\n"
+            "• Video đã bị xóa hoặc private\n\n"
+            "Thử thêm proxy rồi dùng lại\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
         return
 
     video_id = info["video_id"]
