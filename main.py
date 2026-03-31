@@ -118,14 +118,24 @@ STATE = BotState()
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_server_ip() -> str:
+    """Lấy IP PUBLIC thật của server (không phải IP nội bộ)."""
+    import urllib.request
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
+        # Gọi API bên ngoài để lấy IP public thật
+        ip = urllib.request.urlopen(
+            "https://api.ipify.org", timeout=5
+        ).read().decode().strip()
         return ip
     except Exception:
-        return "Không xác định"
+        try:
+            # Fallback: ipinfo.io
+            import json
+            data = urllib.request.urlopen(
+                "https://ipinfo.io/json", timeout=5
+            ).read()
+            return json.loads(data).get("ip", "Không xác định")
+        except Exception:
+            return "Không xác định"
 
 
 def fmt_number(n: int) -> str:
