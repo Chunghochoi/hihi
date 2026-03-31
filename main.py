@@ -165,11 +165,46 @@ def extract_video_id(url: str) -> Optional[str]:
     return match.group(1) if match else None
 
 
-def normalize_proxy(raw: str) -> str:
+def normalize_proxy(raw: str, scheme: str = "http") -> str:
+    """
+    Chuẩn hóa proxy về dạng scheme://[user:pass@]host:port
+    Hỗ trợ tất cả định dạng phổ biến:
+      host:port                    → scheme://host:port
+      host:port:user:pass          → scheme://user:pass@host:port  (Webshare)
+      user:pass@host:port          → scheme://user:pass@host:port
+      scheme://host:port           → giữ nguyên scheme
+      scheme://user:pass@host:port → giữ nguyên
+    """
     raw = raw.strip()
-    if raw and "://" not in raw:
-        raw = "http://" + raw
-    return raw
+    if not raw:
+        return ""
+
+    # Đã có scheme → giữ nguyên
+    if "://" in raw:
+        return raw
+
+    # Webshare format: host:port:user:pass (4 phần phân tách bởi ":")
+    parts = raw.split(":")
+    if len(parts) == 4:
+        host, port, user, passwd = parts
+        return f"{scheme}://{user}:{passwd}@{host}:{port}"
+
+    # user:pass@host:port (có @)
+    if "@" in raw:
+        return f"{scheme}://{raw}"
+
+    # host:port thuần
+    return f"{scheme}://{raw}"
+
+
+def detect_scheme_from_filename(filename: str) -> str:
+    """Tự động nhận dạng loại proxy từ tên file."""
+    name = filename.lower()
+    if "socks5" in name:
+        return "socks5"
+    if "socks4" in name:
+        return "socks4"
+    return "http"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -519,40 +554,99 @@ async def cmd_view_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def cmd_proxy_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /proxy_add [loại] proxy1 proxy2 ...
+    Loại tùy chọn: http (mặc định), socks4, socks5
+    Ví dụ:
+      /proxy_add 1.2.3.4:8080
+      /proxy_add socks5 1.2.3.4:1080
+      /proxy_add 1.2.3.4:6754:user:pass   ← Webshare tự nhận dạng
+    """
     if not context.args:
         await update.message.reply_text(
-            "❌ Cú pháp: `/proxy_add proxy1 proxy2 \\.\\.\\.`\n"
-            "Hoặc gửi file \\.txt chứa danh sách proxy\\.",
+            "❌ Cú pháp:\n"
+            "`/proxy_add proxy1 proxy2` — HTTP mặc định\n"
+            "`/proxy_add socks4 proxy1 proxy2`\n"
+            "`/proxy_add socks5 proxy1 proxy2`\n"
+            "`/proxy_add host:port:user:pass` — Webshare tự nhận\n\n"
+            "Hoặc gửi file \\.txt \\(tên file chứa socks4/socks5 sẽ tự nhận loại\\)\\.",
             parse_mode=ParseMode.MARKDOWN_V2,
         )
         return
 
-    normalized = [normalize_proxy(p) for p in context.args if p.strip()]
+    args = list(context.args)
+
+    # Phát hiện scheme từ arg đầu tiên nếu là keyword
+    scheme = "http"
+    if args[0].lower() in ("http", "socks4", "socks5"):
+        scheme = args.pop(0).lower()
+
+    if not args:
+        await update.message.reply_text("❌ Chưa có proxy nào sau loại\\.",
+                                        parse_mode=ParseMode.MARKDOWN_V2)
+        return
+
+    normalized = [normalize_proxy(p, scheme) for p in args if p.strip()]
+    normalized = [p for p in normalized if p]
     added      = STATE.add_proxies(normalized)
+
+    scheme_emoji = {"http": "🌐", "socks4": "🔷", "socks5": "🔶"}.get(scheme, "🌐")
     await update.message.reply_text(
-        f"✅ Đã thêm `{added}` proxy mới\n"
+        f"✅ Đã thêm `{added}` proxy `{scheme}` mới\n"
         f"📊 Tổng: `{len(STATE.proxies)}` proxy",
         parse_mode=ParseMode.MARKDOWN_V2,
     )
 
 
 async def cmd_proxy_add_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Nhận file .txt chứa proxy.
+    Tự nhận loại từ tên file:
+      socks5_*.txt  → socks5://
+      socks4_*.txt  → socks4://
+      *             → http://
+    Hỗ trợ tất cả định dạng:
+      host:port
+      host:port:user:pass  (Webshare)
+      user:pass@host:port
+      scheme://host:port
+    """
     doc = update.message.document
     if not doc or not (doc.file_name or "").endswith(".txt"):
         return
 
-    await update.message.reply_text("📂 Đang xử lý file proxy\\.\\.\\.",
-                                    parse_mode=ParseMode.MARKDOWN_V2)
+    filename = doc.file_name or ""
+    scheme   = detect_scheme_from_filename(filename)
+    emoji    = {"http": "🌐", "socks4": "🔷", "socks5": "🔶"}.get(scheme, "🌐")
+
+    await update.message.reply_text(
+        f"📂 Đang xử lý file `{escape_md(filename)}`\n"
+        f"{emoji} Loại proxy nhận dạng: `{scheme}`",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
 
     tg_file = await context.bot.get_file(doc.file_id)
     content = await tg_file.download_as_bytearray()
     lines   = content.decode("utf-8", errors="ignore").splitlines()
 
-    normalized = [normalize_proxy(l) for l in lines if l.strip()]
-    added      = STATE.add_proxies(normalized)
+    # Lọc và chuẩn hóa, bỏ qua dòng trống và comment (#)
+    normalized = []
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        p = normalize_proxy(line, scheme)
+        if p:
+            normalized.append(p)
+
+    added = STATE.add_proxies(normalized)
     await update.message.reply_text(
-        f"✅ Đã thêm `{added}` proxy từ file\n"
-        f"📊 Tổng: `{len(STATE.proxies)}` proxy",
+        f"✅ *Đã thêm proxy từ file*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📄 File: `{escape_md(filename)}`\n"
+        f"{emoji} Loại: `{scheme}`\n"
+        f"➕ Thêm mới: `{added}`\n"
+        f"📊 Tổng pool: `{len(STATE.proxies)}`",
         parse_mode=ParseMode.MARKDOWN_V2,
     )
 
@@ -590,13 +684,41 @@ async def cmd_proxy_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                                         parse_mode=ParseMode.MARKDOWN_V2)
         return
 
-    display = STATE.proxies[:20]
-    lines   = "\n".join(f"`{escape_md(p)}`" for p in display)
-    extra   = (f"\n_\\.\\.\\.và {len(STATE.proxies)-20} proxy khác_"
-               if len(STATE.proxies) > 20 else "")
+    # Đếm theo loại
+    counts = {"http": 0, "socks4": 0, "socks5": 0, "other": 0}
+    for p in STATE.proxies:
+        if p.startswith("socks5"):
+            counts["socks5"] += 1
+        elif p.startswith("socks4"):
+            counts["socks4"] += 1
+        elif p.startswith("http"):
+            counts["http"] += 1
+        else:
+            counts["other"] += 1
+
+    # Hiển thị tối đa 15 proxy
+    display = STATE.proxies[:15]
+    def _fmt(p: str) -> str:
+        if p.startswith("socks5"):
+            return f"🔶 `{escape_md(p)}`"
+        if p.startswith("socks4"):
+            return f"🔷 `{escape_md(p)}`"
+        return f"🌐 `{escape_md(p)}`"
+
+    lines = "\n".join(_fmt(p) for p in display)
+    extra = (f"\n_\\.\\.\\.và {len(STATE.proxies)-15} proxy khác_"
+             if len(STATE.proxies) > 15 else "")
+
+    stat = (
+        f"🌐 HTTP: `{counts['http']}` \\| "
+        f"🔷 SOCKS4: `{counts['socks4']}` \\| "
+        f"🔶 SOCKS5: `{counts['socks5']}`"
+    )
 
     await update.message.reply_text(
         f"📋 *Danh sách proxy* \\({len(STATE.proxies)} tổng\\)\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{stat}\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"{lines}{extra}",
         parse_mode=ParseMode.MARKDOWN_V2,
