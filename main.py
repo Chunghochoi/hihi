@@ -30,7 +30,10 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 
+import aiohttp
+import ssl
 import curl_cffi.requests as cfreqs
+from hashlib import md5
 from telegram import Update, Message
 from telegram.ext import (
     Application,
@@ -46,16 +49,6 @@ from telegram.constants import ParseMode
 # ─────────────────────────────────────────────────────────────────────────────
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-
-# TikTok API servers (xoay vòng để tránh rate-limit)
-TIKTOK_API_SERVERS = [
-    "https://api16-normal-c-useast1a.tiktokv.com",
-    "https://api19-core-c-useast1a.tiktokv.com",
-    "https://api16-normal-useast5.tiktokv.com",
-    "https://api21-normal-c-useast1a.tiktokv.com",
-    "https://api22-normal-c-useast1a.tiktokv.com",
-]
-TIKTOK_PLAY_PATH   = "/aweme/v1/playtime/"
 
 REPORT_INTERVAL     = 30   # giây giữa 2 lần báo cáo
 PROXY_CHECK_TIMEOUT = 8    # giây timeout khi test proxy
@@ -440,17 +433,109 @@ async def check_all_proxies(proxies: List[str]) -> Dict[str, bool]:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # VIEW BUFF ENGINE
+# Tham khảo: toolview1 (device profiles) + viewv3 (X-Gorgon algorithm)
 # ─────────────────────────────────────────────────────────────────────────────
 
-TLS_PROFILES = [
-    "chrome124", "chrome120", "chrome110",
-    "chrome107", "chrome104", "safari17_0",
-    "safari16_0", "safari15_5",
+# API endpoint thực hoạt động (từ tool tham khảo)
+TIKTOK_STATS_SERVERS = [
+    "https://api16-core-c-alisg.tiktokv.com",
+    "https://api19-core-c-useast1a.tiktokv.com",
+    "https://api22-core-c-useast1a.tiktokv.com",
+    "https://api16-core-useast6.tiktokv.com",
+]
+TIKTOK_STATS_PATH = "/aweme/v1/aweme/stats/"
+
+# ── X-Gorgon Signature (viewv3 algorithm) ────────────────────────────────────
+
+_GORGON_KEY = [
+    0xDF, 0x77, 0xB9, 0x40, 0xB9, 0x9B, 0x84, 0x83,
+    0xD1, 0xB9, 0xCB, 0xD1, 0xF7, 0xC2, 0xB9, 0x85,
+    0xC3, 0xD0, 0xFB, 0xC3,
 ]
 
-DEVICE_BRANDS = ["samsung", "xiaomi", "huawei", "oppo", "vivo", "realme"]
-OS_VERSIONS   = ["12", "13", "14"]
-OS_APIS       = {"12": "32", "13": "33", "14": "34"}
+
+def _md5(s: str) -> str:
+    return md5(s.encode()).hexdigest()
+
+
+def _reverse_byte(n: int) -> int:
+    h = f"{n:02x}"
+    return int(h[1] + h[0], 16)
+
+
+def generate_x_gorgon(params: str, data: str, cookies: str) -> Dict[str, str]:
+    """
+    Tạo X-Gorgon và X-Khronos header — bắt buộc để TikTok đếm view.
+    Thuật toán từ viewv3 (reverse-engineered từ TikTok app).
+    """
+    ts = int(time.time())
+
+    g  = _md5(params)
+    g += _md5(data)    if data    else "0" * 32
+    g += _md5(cookies) if cookies else "0" * 32
+    g += "0" * 32
+
+    payload = []
+    for i in range(0, 12, 4):
+        chunk = g[8 * i: 8 * (i + 1)]
+        for j in range(4):
+            payload.append(int(chunk[j * 2: (j + 1) * 2], 16))
+
+    payload.extend([0x0, 0x6, 0xB, 0x1C])
+    payload.extend([
+        (ts & 0xFF000000) >> 24,
+        (ts & 0x00FF0000) >> 16,
+        (ts & 0x0000FF00) >> 8,
+        (ts & 0x000000FF),
+    ])
+
+    enc = [a ^ b for a, b in zip(payload, _GORGON_KEY)]
+    for i in range(0x14):
+        C = _reverse_byte(enc[i])
+        D = enc[(i + 1) % 0x14]
+        F = int(bin(C ^ D)[2:].zfill(8)[::-1], 2)
+        H = ((F ^ 0xFFFFFFFF) ^ 0x14) & 0xFF
+        enc[i] = H
+
+    signature = "".join(f"{x:02x}" for x in enc)
+    return {
+        "X-Gorgon":  "840280416000" + signature,
+        "X-Khronos": str(ts),
+    }
+
+
+# ── Device profiles nâng cấp (toolview1) ─────────────────────────────────────
+
+@dataclass
+class _DeviceSpec:
+    model:        str
+    version:      str
+    api_level:    int
+    brand:        str
+    manufacturer: str
+
+
+_DEVICES = [
+    _DeviceSpec("Pixel 6",   "13", 33, "Google",  "Google"),
+    _DeviceSpec("Pixel 7",   "14", 34, "Google",  "Google"),
+    _DeviceSpec("SM-S901B",  "13", 33, "Samsung", "samsung"),
+    _DeviceSpec("SM-S911B",  "14", 34, "Samsung", "samsung"),
+    _DeviceSpec("2201123C",  "13", 33, "Xiaomi",  "Xiaomi"),
+    _DeviceSpec("2210132C",  "14", 34, "Xiaomi",  "Xiaomi"),
+    _DeviceSpec("CPH2447",   "13", 33, "OPPO",    "OPPO"),
+    _DeviceSpec("CPH2499",   "14", 34, "OPPO",    "OPPO"),
+    _DeviceSpec("V2217",     "13", 33, "vivo",    "vivo"),
+    _DeviceSpec("V2309",     "14", 34, "vivo",    "vivo"),
+    _DeviceSpec("RMX3371",   "13", 33, "realme",  "realme"),
+    _DeviceSpec("RMX3843",   "14", 34, "realme",  "realme"),
+    _DeviceSpec("LE2123",    "13", 33, "OnePlus", "OnePlus"),
+    _DeviceSpec("CPH2451",   "14", 34, "OnePlus", "OnePlus"),
+]
+
+_LANGS    = ["vi", "en", "id", "th", "ms"]
+_CARRIERS = ["VN", "US", "ID", "TH", "MY"]
+_MCC      = ["45201", "310260", "51010", "51009", "52001"]
+_ACS      = ["wifi", "4g", "5g"]
 
 
 def _rand_digits(n: int) -> str:
@@ -461,83 +546,122 @@ def _rand_hex(n: int) -> str:
     return "".join(random.choices("0123456789abcdef", k=n))
 
 
-def make_device() -> dict:
-    """Tạo thông số thiết bị ngẫu nhiên thực tế."""
-    os_ver    = random.choice(OS_VERSIONS)
-    brand     = random.choice(DEVICE_BRANDS)
-    device_id = _rand_digits(19)
-    iid       = _rand_digits(19)   # install_id
-    openudid  = _rand_hex(16)
-    cdid      = str(uuid.uuid4())  # client device id
-    return {
-        "device_id":      device_id,
-        "iid":            iid,
-        "openudid":       openudid,
-        "cdid":           cdid,
-        "device_brand":   brand,
-        "device_type":    f"{brand.upper()}-SM-G991B",
-        "os":             "android",
-        "os_version":     os_ver,
-        "os_api":         OS_APIS[os_ver],
-        "resolution":     random.choice(["1080*2400", "1080*2340", "1440*3200"]),
-        "dpi":            str(random.choice([420, 480, 560])),
+def _make_request_data(video_id: str):
+    """
+    Tạo URL, body data, cookies và headers cho 1 view request.
+    Trả về (url, data_dict, cookies_dict, headers_dict, query_string)
+    """
+    dev        = random.choice(_DEVICES)
+    device_id  = str(random.randint(6_800_000_000_000_000_000,
+                                    6_999_999_999_999_999_999))
+    openudid   = _rand_hex(16)
+    cdid       = _rand_hex(16)
+    iid        = str(random.randint(6_800_000_000_000_000_000,
+                                    6_999_999_999_999_999_999))
+    lang       = random.choice(_LANGS)
+    carrier    = random.choice(_CARRIERS)
+    mcc        = random.choice(_MCC)
+    ac         = random.choice(_ACS)
+    server     = random.choice(TIKTOK_STATS_SERVERS)
+
+    params = (
+        f"channel=googleplay"
+        f"&aid=1233"
+        f"&app_name=musical_ly"
+        f"&version_code=400304"
+        f"&version_name=40.3.4"
+        f"&device_platform=android"
+        f"&device_type={dev.model.replace(' ', '+')}"
+        f"&device_brand={dev.brand}"
+        f"&device_manufacturer={dev.manufacturer}"
+        f"&os_version={dev.version}"
+        f"&os_api={dev.api_level}"
+        f"&device_id={device_id}"
+        f"&openudid={openudid}"
+        f"&cdid={cdid}"
+        f"&iid={iid}"
+        f"&app_language={lang}"
+        f"&tz_name=Asia%2FHo_Chi_Minh"
+        f"&tz_offset=25200"
+        f"&carrier_region={carrier}"
+        f"&sys_region={carrier.lower()}"
+        f"&ac={ac}"
+        f"&mcc_mnc={mcc}"
+        f"&pass-route=1"
+        f"&pass-region=1"
+    )
+    url = f"{server}{TIKTOK_STATS_PATH}?{params}"
+
+    data = {
+        "item_id":    video_id,
+        "play_delta": 1,
+        "action_time": int(time.time()),
+        "source":     random.choice([1, 2, 3, 4]),
+        "media_type": 4,
+        "content_type": "video",
     }
 
-
-def build_view_payload(video_id: str, device: dict, t_start: int, play_delta: int) -> dict:
-    """
-    Xây dựng payload đầy đủ cho TikTok playtime API.
-    Các trường này là bắt buộc để server nhận request.
-    """
-    ver_code = random.choice(["320403", "310303", "300904"])
-    ver_name = {"320403": "32.4.3", "310303": "31.3.3", "300904": "30.9.4"}[ver_code]
-    return {
-        # App info
-        "aid":                "1233",
-        "app_name":           "musical_ly",
-        "app_language":       "en",
-        "version_code":       ver_code,
-        "version_name":       ver_name,
-        "channel":            random.choice(["googleplay", "xiaomi", "huawei_store"]),
-        "ab_version":         ver_name,
-        "ssmix":              "a",
-        "manifest_version_code": ver_code,
-        "update_version_code":   ver_code,
-        # Device
-        "device_id":          device["device_id"],
-        "iid":                device["iid"],
-        "openudid":           device["openudid"],
-        "cdid":               device["cdid"],
-        "device_brand":       device["device_brand"],
-        "device_type":        device["device_type"],
-        "device_platform":    "android",
-        "os":                 "android",
-        "os_version":         device["os_version"],
-        "os_api":             device["os_api"],
-        "resolution":         device["resolution"],
-        "dpi":                device["dpi"],
-        # Network
-        "ac":                 random.choice(["wifi", "4g", "5g"]),
-        "ac2":                "wifi5g",
-        "carrier_region":     random.choice(["US", "GB", "CA", "AU", "SG"]),
-        "sys_region":         "US",
-        "region":             "US",
-        "timezone_name":      "America/New_York",
-        "timezone_offset":    "-14400",
-        "language":           "en",
-        "locale":             "en_US",
-        # Video play info
-        "aweme_id":           video_id,
-        "action_time":        str(t_start),
-        "play_delta":         str(play_delta),
-        "ts":                 str(t_start),
-        "is_play_phone_mode": "0",
-        "play_exit_type":     "3" if play_delta > 0 else "0",
-        # Anti-detection
-        "cronet_version":     "TTNetVersion:6c7669b9 2023-12-18",
-        "build_number":       ver_name,
+    import secrets as _sec
+    cookies = {
+        "sessionid": _sec.token_hex(20),
+        "uid":       str(random.randint(1_000_000_000, 9_999_999_999)),
+        "cdids":     _rand_hex(16),
     }
 
+    ua = (
+        f"com.ss.android.ugc.trill/400304 "
+        f"(Linux; U; Android {dev.version}; {lang}_{carrier}; "
+        f"{dev.model}; Build/PI; tt-ok/3.12.13)"
+    )
+    headers = {
+        "Content-Type":      "application/x-www-form-urlencoded; charset=UTF-8",
+        "User-Agent":        ua,
+        "Accept-Encoding":   "gzip",
+        "Connection":        "Keep-Alive",
+        "Host":              server.replace("https://", "").replace("http://", ""),
+        "sdk-version":       "2",
+        "x-tt-dm-status":    "login=1; launch=0",
+    }
+
+    return url, params, data, cookies, headers
+
+
+# ── aiohttp session pool ──────────────────────────────────────────────────────
+
+_ssl_ctx = ssl.create_default_context()
+_ssl_ctx.check_hostname = False
+_ssl_ctx.verify_mode    = ssl.CERT_NONE
+
+_aio_session: Optional[aiohttp.ClientSession] = None
+
+
+async def _get_aio_session() -> aiohttp.ClientSession:
+    global _aio_session
+    if _aio_session is None or _aio_session.closed:
+        connector = aiohttp.TCPConnector(
+            limit=0,
+            limit_per_host=0,
+            keepalive_timeout=30,
+            enable_cleanup_closed=True,
+            ssl=_ssl_ctx,
+        )
+        timeout = aiohttp.ClientTimeout(total=15, connect=5, sock_read=10)
+        _aio_session = aiohttp.ClientSession(
+            timeout=timeout,
+            connector=connector,
+            cookie_jar=aiohttp.DummyCookieJar(),
+        )
+    return _aio_session
+
+
+async def _close_aio_session() -> None:
+    global _aio_session
+    if _aio_session and not _aio_session.closed:
+        await _aio_session.close()
+        _aio_session = None
+
+
+# ── Core view request ─────────────────────────────────────────────────────────
 
 async def send_single_view(
     video_id:   str,
@@ -545,88 +669,101 @@ async def send_single_view(
     worker_idx: int,
 ) -> bool:
     """
-    Gửi 1 view theo 2 pha với thiết bị giả lập thực tế:
-      Pha 1 — play_delta=0  (bắt đầu xem)
-      Delay — 10–25s        (mô phỏng xem thực)
-      Pha 2 — play_delta=N  (kết thúc xem, N = thời gian đã xem)
-    Xoay vòng giữa nhiều API server.
+    Gửi 1 view request theo chuẩn TikTok:
+    - Endpoint: aweme/v1/aweme/stats/ (endpoint thực hoạt động)
+    - X-Gorgon: được tính đúng thuật toán reverse-engineering
+    - play_delta=1 (1 request duy nhất, không cần 2 pha)
     """
-    tls    = TLS_PROFILES[worker_idx % len(TLS_PROFILES)]
-    server = TIKTOK_API_SERVERS[worker_idx % len(TIKTOK_API_SERVERS)]
-    api_url = server + TIKTOK_PLAY_PATH
+    url, params, data, cookies, base_headers = _make_request_data(video_id)
 
-    sess = cfreqs.AsyncSession(impersonate=tls)
-    if proxy:
-        sess.proxies = {"http": proxy, "https": proxy}
+    # Tính X-Gorgon từ query string + body + cookies
+    data_str    = "&".join(f"{k}={v}" for k, v in data.items())
+    cookies_str = "&".join(f"{k}={v}" for k, v in cookies.items())
+    sig = generate_x_gorgon(params, data_str, cookies_str)
+    headers = {**base_headers, **sig}
 
-    device  = make_device()
-    t_start = int(time.time())
+    proxy_url = proxy if proxy else None
 
-    # User-Agent khớp với app version
-    ver_name = "30.9.4"
-    ua = (
-        f"com.zhiliaoapp.musically/{device['iid']} "
-        f"(Linux; U; Android {device['os_version']}; en_US; {device['device_type']}; "
-        f"Build/TP1A.220624.014; Cronet/TTNetVersion:6c7669b9 2023-12-18 QuicVersion:0144d358 2023-12-14)"
-    )
-
-    request_headers = {
-        "User-Agent":     ua,
-        "Content-Type":   "application/x-www-form-urlencoded",
-        "X-SS-REQ-TICKET": str(int(time.time() * 1000)),
-        "sdk-version":    "2",
-        "Accept-Encoding": "gzip",
-    }
-
+    sess = await _get_aio_session()
     try:
-        # Pha 1: bắt đầu xem
-        payload1 = build_view_payload(video_id, device, t_start, 0)
-        await sess.post(api_url, data=payload1, headers=request_headers, timeout=12)
-
-        # Mô phỏng thời gian xem: 10–25 giây
-        watch_time = random.randint(10, 25)
-        await asyncio.sleep(watch_time)
-
-        # Pha 2: kết thúc xem
-        t_end   = int(time.time())
-        payload2 = build_view_payload(video_id, device, t_end, t_end - t_start)
-        r2 = await sess.post(api_url, data=payload2, headers=request_headers, timeout=12)
-
-        return r2.status_code < 400
-
+        async with sess.post(
+            url,
+            data=data,
+            headers=headers,
+            cookies=cookies,
+            proxy=proxy_url,
+            ssl=False,
+        ) as resp:
+            if resp.status == 200:
+                return True
+            elif resp.status == 429:
+                await asyncio.sleep(2)
+                return False
+            else:
+                return False
     except Exception:
         return False
 
 
 async def buff_worker(
-    worker_idx: int,
-    video_id:   str,
-    stop_event: asyncio.Event,
-    counter:    List[int],
+    worker_idx:  int,
+    video_id:    str,
+    stop_event:  asyncio.Event,
+    counter:     List[int],
+    fail_counter: List[int],
+    semaphore:   asyncio.Semaphore,
 ) -> None:
-    """1 worker chạy liên tục cho đến khi stop_event được set."""
+    """
+    1 worker chạy liên tục với adaptive delay (toolview1 algorithm):
+    - Thành công nhiều liên tiếp → giảm delay
+    - Thất bại → tăng delay
+    """
+    consecutive_success = 0
+    base_delay          = 0.001
+
     while not stop_event.is_set():
-        proxy   = STATE.get_proxy(worker_idx + int(time.time()))
-        success = await send_single_view(video_id, proxy, worker_idx)
+        async with semaphore:
+            proxy   = STATE.get_proxy(worker_idx + int(time.time()))
+            success = await send_single_view(video_id, proxy, worker_idx)
+
         if success:
-            counter[0] += 1
-        await asyncio.sleep(1 + (worker_idx % 5) * 0.5)
+            counter[0]      += 1
+            consecutive_success += 1
+            if consecutive_success > 100:
+                delay = base_delay * 0.5
+            elif consecutive_success > 50:
+                delay = base_delay * 0.7
+            else:
+                delay = base_delay
+        else:
+            fail_counter[0]     += 1
+            consecutive_success  = 0
+            delay = base_delay * 3
+
+        await asyncio.sleep(delay + random.uniform(0, 0.002))
 
 
 async def run_buff_session(app: Application, session: BuffSession) -> None:
     """
     Vòng lặp chính:
-      • Khởi chạy N worker coroutines
+      • Khởi chạy N worker coroutines với semaphore kiểm soát concurrency
+      • Adaptive delay từ toolview1 (success → giảm delay, fail → tăng delay)
       • Mỗi REPORT_INTERVAL giây → fetch view → gửi báo cáo Telegram
       • Dừng khi stop_event set
     """
     chat_id  = session.chat_id
     video_id = session.video_id
     num_w    = STATE.workers
-    counter: List[int] = [0]
+    counter:      List[int] = [0]
+    fail_counter: List[int] = [0]
+
+    # Semaphore giới hạn request đồng thời (tránh overwhelm connection pool)
+    semaphore = asyncio.Semaphore(min(500, num_w // 2 + 1))
 
     worker_tasks = [
-        asyncio.create_task(buff_worker(i, video_id, session.stop_event, counter))
+        asyncio.create_task(
+            buff_worker(i, video_id, session.stop_event, counter, fail_counter, semaphore)
+        )
         for i in range(num_w)
     ]
 
@@ -638,20 +775,26 @@ async def run_buff_session(app: Application, session: BuffSession) -> None:
             now = time.time()
 
             if now - last_report >= REPORT_INTERVAL:
-                last_report = now
+                last_report   = now
                 info          = await fetch_video_info(session.video_url)
                 current_views = info["views"] if info else session.initial_views
                 gained        = current_views - session.initial_views
                 elapsed       = now - session.start_time
+                total_req     = counter[0] + fail_counter[0]
+                success_rate  = (counter[0] / total_req * 100) if total_req > 0 else 0.0
+                vps           = counter[0] / elapsed if elapsed > 0 else 0.0
 
                 text = (
                     f"📊 *Báo cáo tiến độ*\n"
                     f"━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🎬 Video ID: `{video_id}`\n"
+                    f"🎬 Video ID: `{escape_md(video_id)}`\n"
                     f"⏱ Thời gian: `{fmt_duration(elapsed)}`\n"
                     f"👁 View hiện tại: `{fmt_number(current_views)}`\n"
                     f"📈 View đã tăng: `\\+{fmt_number(gained)}`\n"
                     f"🚀 Requests gửi: `{fmt_number(counter[0])}`\n"
+                    f"⚡ Tốc độ: `{vps:.1f}` req/s\n"
+                    f"🎯 Tỷ lệ thành công: `{success_rate:.1f}%`\n"
+                    f"❌ Thất bại: `{fmt_number(fail_counter[0])}`\n"
                     f"⚡ Luồng: `{num_w}`\n"
                     f"🔌 Proxy: `{len(STATE.proxies)}`\n"
                     f"━━━━━━━━━━━━━━━━━━━━━\n"
@@ -665,21 +808,25 @@ async def run_buff_session(app: Application, session: BuffSession) -> None:
         for t in worker_tasks:
             t.cancel()
         await asyncio.gather(*worker_tasks, return_exceptions=True)
+        await _close_aio_session()
 
         elapsed       = time.time() - session.start_time
         info          = await fetch_video_info(session.video_url)
         current_views = info["views"] if info else session.initial_views
         gained        = current_views - session.initial_views
+        total_req     = counter[0] + fail_counter[0]
+        success_rate  = (counter[0] / total_req * 100) if total_req > 0 else 0.0
 
         end_text = (
             f"🛑 *Đã dừng buff*\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🎬 Video ID: `{video_id}`\n"
+            f"🎬 Video ID: `{escape_md(video_id)}`\n"
             f"⏱ Tổng thời gian: `{fmt_duration(elapsed)}`\n"
             f"👁 View ban đầu: `{fmt_number(session.initial_views)}`\n"
             f"👁 View hiện tại: `{fmt_number(current_views)}`\n"
             f"📈 Tổng view tăng: `\\+{fmt_number(gained)}`\n"
-            f"🚀 Tổng requests: `{fmt_number(counter[0])}`"
+            f"🚀 Tổng requests: `{fmt_number(counter[0])}`\n"
+            f"🎯 Tỷ lệ thành công: `{success_rate:.1f}%`"
         )
         await app.bot.send_message(
             chat_id=chat_id, text=end_text, parse_mode=ParseMode.MARKDOWN_V2
